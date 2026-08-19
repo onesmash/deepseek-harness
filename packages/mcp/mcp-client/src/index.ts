@@ -14,10 +14,12 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { scopeOf } from '@deepseek-ai/dsh-scope'
+import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 import z from '@deepseek-ai/schemastery'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { RECONNECT_DEFAULTS, resolveReconnectPolicy, startConnection } from './connection.ts'
-import type { ReconnectConfig } from './connection.ts'
+import type { ConnectionOutcome, ReconnectConfig } from './connection.ts'
 // Side-effect type import: declaration-merges `ctx.tools` onto Context.
 import type {} from '@deepseek-ai/dsh-tools'
 
@@ -33,6 +35,9 @@ export const inject = ['tools']
 /** Default timeout for individual MCP tool calls (ms). */
 const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60_000
 
+/** Default maximum time to publish the initial MCP tool generation (ms). */
+const DEFAULT_STARTUP_TIMEOUT_MS = 30_000
+
 /** Valid `serverName`, kept below the public tool-name budget. */
 const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 
@@ -42,7 +47,7 @@ const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
  * namespace is a configuration error surfaced at plugin load, never silent
  * shadowing.
  */
-const activeServerNames = new WeakMap<Context, Set<string>>()
+const activeServerNames = new WeakMap<Context, Map<ScopeKey | undefined, Set<string>>>()
 
 // ---- Config ----
 
@@ -53,7 +58,10 @@ export interface StdioConfig {
   /**
    * Stable local namespace for this server's model-facing tool names
    * (`mcp__<serverName>__<rawName>`). Must match `[A-Za-z0-9_-]{1,32}` and be
-   * unique across live mcp-client instances.
+   * unique within its exact scope; root and every Agent scope reserve names
+   * independently. A scoped generation rejects a pre-existing root/global
+   * tool with the same public name; a root/global tool registered later
+   * follows the ToolRuntime's usual scoped shadowing.
    */
   serverName: string
   /** Executable used to start the server. */
@@ -66,6 +74,8 @@ export interface StdioConfig {
   cwd: string
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** Maximum time to connect and publish the initial tool generation in milliseconds (default 30000). */
+  startupTimeoutMs?: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
@@ -79,7 +89,10 @@ export interface StreamableHttpConfig {
   /**
    * Stable local namespace for this server's model-facing tool names
    * (`mcp__<serverName>__<rawName>`). Must match `[A-Za-z0-9_-]{1,32}` and be
-   * unique across live mcp-client instances.
+   * unique within its exact scope; root and every Agent scope reserve names
+   * independently. A scoped generation rejects a pre-existing root/global
+   * tool with the same public name; a root/global tool registered later
+   * follows the ToolRuntime's usual scoped shadowing.
    */
   serverName: string
   /** MCP endpoint URL. */
@@ -88,6 +101,8 @@ export interface StreamableHttpConfig {
   headers: Record<string, string>
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** Maximum time to connect and publish the initial tool generation in milliseconds (default 30000). */
+  startupTimeoutMs?: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
@@ -113,6 +128,7 @@ export const Config = z.union([
     env: z.dict(String).default({}),
     cwd: z.string().default(''),
     toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+    startupTimeoutMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STARTUP_TIMEOUT_MS),
     failOnStartupError: z.boolean().default(false),
     reconnect: Reconnect,
   }),
@@ -122,10 +138,20 @@ export const Config = z.union([
     url: z.string().required(),
     headers: z.dict(String).default({}),
     toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+    startupTimeoutMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STARTUP_TIMEOUT_MS),
     failOnStartupError: z.boolean().default(false),
     reconnect: Reconnect,
   }),
 ]) as unknown as z<Config>
+
+/** Resolve and validate the startup deadline for programmatic plugin construction. */
+function resolveStartupTimeoutMs(timeoutMs: number | undefined, path: string): number {
+  const resolved = timeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS
+  if (!Number.isInteger(resolved) || resolved < 1 || resolved > MAX_TIMER_DELAY_MS) {
+    throw new Error(`${path} must be an integer between 1 and ${MAX_TIMER_DELAY_MS}`)
+  }
+  return resolved
+}
 
 // ---- Plugin apply ----
 
@@ -142,22 +168,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // construction that bypassed Schemastery) rejects THIS instance before any
   // effect registers.
   const reconnect = resolveReconnectPolicy(config.reconnect, `mcp-client(${config.serverName}): reconnect`)
+  const startupTimeoutMs = resolveStartupTimeoutMs(config.startupTimeoutMs, `mcp-client(${config.serverName}): startupTimeoutMs`)
 
   // Reserve the namespace next: a duplicate `serverName` fails THIS instance
   // at load with an actionable error and leaves the earlier instance intact.
   ctx.effect(() => {
-    let names = activeServerNames.get(ctx.root)
-    if (!names) {
-      names = new Set()
-      activeServerNames.set(ctx.root, names)
+    let scopes = activeServerNames.get(ctx.root)
+    if (!scopes) {
+      scopes = new Map()
+      activeServerNames.set(ctx.root, scopes)
     }
-    if (names.has(config.serverName)) {
+    const scope = scopeOf(ctx)
+    const names = scopes.get(scope)
+    if (names?.has(config.serverName) === true) {
       throw new Error(
         `mcp-client: serverName "${config.serverName}" is already in use by another mcp-client instance — pick a unique serverName in cordis.yml`,
       )
     }
-    names.add(config.serverName)
-    return () => void names.delete(config.serverName)
+    const reserved = names ?? new Set<string>()
+    scopes.set(scope, reserved)
+    reserved.add(config.serverName)
+    return () => {
+      reserved.delete(config.serverName)
+      if (reserved.size === 0) scopes.delete(scope)
+      if (scopes.size === 0) activeServerNames.delete(ctx.root)
+    }
   }, 'mcp-client.serverName')
 
   // The supervisor owns the client/transport generations, the reconnect
@@ -165,8 +200,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // quiesces in-flight work, and unregisters the current generation.
   const connection = startConnection(ctx, config, reconnect)
 
+  let startupTimer: NodeJS.Timeout | undefined
+  const clearStartupTimer = (): void => {
+    if (startupTimer === undefined) return
+    clearTimeout(startupTimer)
+    startupTimer = undefined
+  }
+
   ctx.effect(() => {
-    return () => connection.dispose()
+    return async () => {
+      clearStartupTimer()
+      await connection.dispose()
+    }
   }, 'mcp-client.connection')
 
   // Block plugin activation on the initial connection + tool discovery so
@@ -174,7 +219,23 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // When failOnStartupError is true, a failed initial attempt rejects the
   // fiber (Cordis rolls it back); otherwise the error is logged and the
   // supervisor enters its reconnect loop.
-  const outcome = await connection.ready
+  let timingOut = false
+  const timeoutOutcome = new Promise<ConnectionOutcome>((resolve) => {
+    startupTimer = setTimeout(() => {
+      startupTimer = undefined
+      timingOut = true
+      void connection.dispose().then(
+        () => { resolve({ error: new Error('MCP startup timed out') }) },
+        () => {
+          ctx.logger.error('mcp-client: startup timeout cleanup failed')
+          resolve({ error: new Error('MCP startup timed out') })
+        },
+      )
+    }, startupTimeoutMs)
+    startupTimer.unref()
+  })
+  const readyOutcome = connection.ready.then(outcome => timingOut ? timeoutOutcome : outcome)
+  const outcome = await Promise.race([readyOutcome, timeoutOutcome]).finally(clearStartupTimer)
   if (outcome.error !== undefined && config.failOnStartupError) {
     throw new Error(`mcp-client(${config.serverName}): initial connection or tool synchronization failed`, { cause: outcome.error })
   }

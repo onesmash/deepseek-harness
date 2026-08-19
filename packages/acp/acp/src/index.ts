@@ -34,11 +34,13 @@ import {
   type Stream,
 } from '@agentclientprotocol/sdk'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
 import { SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
 // Side-effect type import: declaration-merges the approval waterfall answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
 import { AcpContentError, admitAcpPrompt, assistantBlockToAcp, supportsAcpImagePrompts } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
+import { InvalidMcpServerConfigError, mapMcpServers } from './mcp-config.ts'
 
 export const name = 'acp'
 /** The bridge creates and owns agents; every other concern is carried by the agent composition. */
@@ -296,6 +298,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
           agentCapabilities: {
             promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
+            mcpCapabilities: { http: true },
           },
           authMethods: [],
         }
@@ -308,16 +311,36 @@ export function apply(ctx: Context, config: AcpConfig): void {
       async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
         assertOpen()
         validateSessionParams(params)
+        let mappedServers: ReturnType<typeof mapMcpServers>
+        try {
+          mappedServers = mapMcpServers(params.mcpServers, params.cwd)
+        } catch (error: unknown) {
+          if (error instanceof InvalidMcpServerConfigError) throw invalidParams(error.message)
+          throw invalidParams('mcpServers contains an invalid MCP server configuration')
+        }
         const sessionId = SessionId(randomUUID())
         // No preset composition: the ACP bundle keeps the model-facing rows in
         // the host plane, so this agent reads them from the global layer. A
         // deployment that configures a roster has to join one here first
         // (@deepseek-ai/dsh-agent-presets README, "Composing a child agent").
-        const handle = await agents.create({
-          sessionId,
-          meta: { cwd: params.cwd },
-          agentOptions: agentOptions(config),
-        })
+        let handle
+        try {
+          handle = await agents.create({
+            sessionId,
+            meta: { cwd: params.cwd },
+            agentOptions: agentOptions(config),
+            ...mappedServers.length === 0 ? {} : {
+              setup: async (agentCtx) => {
+                for (const { config: serverConfig } of mappedServers) {
+                  await agentCtx.plugin(mcpClient, serverConfig)
+                }
+              },
+            },
+          })
+        } catch (error: unknown) {
+          if (mappedServers.length > 0) throw internalError('MCP server startup failed')
+          throw error
+        }
         /* v8 ignore next 4 -- a real stdio close can race an in-flight create. */
         if (closed) {
           await handle.dispose()
@@ -541,5 +564,4 @@ function validateSessionParams(params: NewSessionRequest): void {
   if (params.additionalDirectories !== undefined && params.additionalDirectories.length > 0) {
     throw invalidParams('additionalDirectories is not supported')
   }
-  if (params.mcpServers.length > 0) throw invalidParams('mcpServers is not supported')
 }

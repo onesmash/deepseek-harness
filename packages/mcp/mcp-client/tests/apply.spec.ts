@@ -4,8 +4,10 @@
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import { createScope, scopeOf } from '@deepseek-ai/dsh-scope'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import type { Config } from '@deepseek-ai/dsh-mcp-client'
 
 // ---- Mock MCP SDK ----
@@ -56,6 +58,10 @@ vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({
 // mocked SDK even through a static import.
 import { apply, name, inject, Config as ConfigSchema } from '@deepseek-ai/dsh-mcp-client/src/index.ts'
 
+const ScopedMcpClient = Object.assign(async function scopedMcpClient(inner: Context, instanceConfig: Config): Promise<void> {
+  await apply(inner, instanceConfig)
+}, { inject })
+
 // ---- Helpers ----
 
 async function mountRegistry(): Promise<Context> {
@@ -63,6 +69,45 @@ async function mountRegistry(): Promise<Context> {
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
   return ctx
+}
+
+async function createAgentScope(ctx: Context): Promise<{ ctx: Context; dispose(): Promise<void> }> {
+  let agentScope: Context | undefined
+  const fiber = ctx.plugin({
+    name: 'mcp-client-test-agent-scope',
+    inject: ['tools'],
+    apply(scopeCtx) {
+      const scope = createScope(scopeCtx, {})
+      agentScope = scope.ctx
+      return () => scope.dispose()
+    },
+  })
+  await fiber
+  if (agentScope === undefined) throw new Error('test agent scope did not initialize')
+  return { ctx: agentScope, dispose: async () => { await fiber.dispose() } }
+}
+
+async function mountMcpInAgentScope(serverName: string, agentScope: Context, config?: Partial<Pick<Config, 'failOnStartupError'>>) {
+  const fiber = agentScope.plugin(ScopedMcpClient, {
+    ...stdioConfig,
+    serverName,
+    ...config,
+  })
+  await fiber
+  return fiber
+}
+
+function registerPlainRootTool(ctx: Context, name: string): void {
+  ctx.tools.register({
+    name,
+    description: 'Plain root tool',
+    parameters: { type: 'object' },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value as string }],
+    },
+    execute: async () => 'root',
+  })
 }
 
 function sleep(ms: number): Promise<void> {
@@ -82,6 +127,7 @@ const stdioConfig: Config = {
   env: {},
   cwd: '',
   toolCallTimeoutMs: 60_000,
+  startupTimeoutMs: 30_000,
   failOnStartupError: false,
 }
 
@@ -140,6 +186,37 @@ describe('mcp-client plugin module exports', () => {
       reconnect: { initialDelayMs: 100 },
     } as never)
     expect(partial.reconnect).toEqual({ enabled: true, initialDelayMs: 100, maxDelayMs: 30_000, maxAttempts: 10 })
+  })
+
+  it('Config schema materializes and validates the startup timeout', () => {
+    expect((ConfigSchema({
+      transport: 'stdio',
+      serverName: 'srv',
+      command: 'echo',
+    } as never) as { startupTimeoutMs?: number }).startupTimeoutMs).toBe(30_000)
+    expect(() => ConfigSchema({
+      transport: 'stdio',
+      serverName: 'srv',
+      command: 'echo',
+      startupTimeoutMs: 0,
+    } as never)).toThrow()
+    expect(() => ConfigSchema({
+      transport: 'stdio',
+      serverName: 'srv',
+      command: 'echo',
+      startupTimeoutMs: 1.5,
+    } as never)).toThrow()
+    expect((ConfigSchema({
+      transport: 'streamable-http',
+      serverName: 'srv',
+      url: 'https://example.test/mcp',
+    } as never) as { startupTimeoutMs?: number }).startupTimeoutMs).toBe(30_000)
+    expect((ConfigSchema({
+      transport: 'streamable-http',
+      serverName: 'srv',
+      url: 'https://example.test/mcp',
+      startupTimeoutMs: MAX_TIMER_DELAY_MS,
+    } as never) as { startupTimeoutMs?: number }).startupTimeoutMs).toBe(MAX_TIMER_DELAY_MS)
   })
 
   it('Config schema rejects an invalid reconnect block', () => {
@@ -236,6 +313,150 @@ describe('apply (plugin lifecycle)', () => {
 
     expect(ctx.tools.get('mcp__srv__remote')).toBeDefined()
     expect(other.tools.get('mcp__srv__remote')).toBeDefined()
+  })
+
+  it('reserves server names in the exact Agent scope and releases them on disposal', async () => {
+    const firstScope = await createAgentScope(ctx)
+    const secondScope = await createAgentScope(ctx)
+    let first: Awaited<ReturnType<typeof mountMcpInAgentScope>> | undefined
+    let second: Awaited<ReturnType<typeof mountMcpInAgentScope>> | undefined
+    let reused: Awaited<ReturnType<typeof mountMcpInAgentScope>> | undefined
+
+    try {
+      first = await mountMcpInAgentScope('fixture', firstScope.ctx)
+      second = await mountMcpInAgentScope('fixture', secondScope.ctx)
+      await expect(mountMcpInAgentScope('fixture', firstScope.ctx)).rejects.toThrow(/already in use/)
+
+      await first.dispose()
+      first = undefined
+      reused = await mountMcpInAgentScope('fixture', firstScope.ctx)
+    } finally {
+      await reused?.dispose()
+      await first?.dispose()
+      await second?.dispose()
+      await firstScope.dispose()
+      await secondScope.dispose()
+    }
+  })
+
+  it('allows one serverName in root then an Agent scope when public tool names differ', async () => {
+    mockListTools.mockResolvedValue({
+      tools: [{ name: 'root', description: 'A root tool', inputSchema: { type: 'object' } }],
+      nextCursor: undefined,
+    })
+    const root = ctx.plugin({ name: 'mcp-client-root', inject, apply }, {
+      ...stdioConfig,
+      serverName: 'shared',
+    })
+    await root.await()
+    const agentScope = await createAgentScope(ctx)
+    let child: Awaited<ReturnType<typeof mountMcpInAgentScope>> | undefined
+
+    try {
+      mockListTools.mockResolvedValue({
+        tools: [{ name: 'child', description: 'An Agent tool', inputSchema: { type: 'object' } }],
+        nextCursor: undefined,
+      })
+      child = await mountMcpInAgentScope('shared', agentScope.ctx)
+
+      expect(ctx.tools.get('mcp__shared__root')).toBeDefined()
+      expect(ctx.tools.get('mcp__shared__child', scopeOf(agentScope.ctx))).toBeDefined()
+    } finally {
+      await child?.dispose()
+      await agentScope.dispose()
+      await root.dispose()
+    }
+  })
+
+  it('allows one serverName in an Agent scope then root when public tool names differ', async () => {
+    mockListTools.mockResolvedValue({
+      tools: [{ name: 'child', description: 'An Agent tool', inputSchema: { type: 'object' } }],
+      nextCursor: undefined,
+    })
+    const agentScope = await createAgentScope(ctx)
+    let child: Awaited<ReturnType<typeof mountMcpInAgentScope>> | undefined
+    let root: Awaited<ReturnType<typeof ctx.plugin>> | undefined
+
+    try {
+      child = await mountMcpInAgentScope('shared', agentScope.ctx)
+      mockListTools.mockResolvedValue({
+        tools: [{ name: 'root', description: 'A root tool', inputSchema: { type: 'object' } }],
+        nextCursor: undefined,
+      })
+      root = ctx.plugin({ name: 'mcp-client-root', inject, apply }, {
+        ...stdioConfig,
+        serverName: 'shared',
+      })
+      await root.await()
+
+      expect(ctx.tools.get('mcp__shared__root')).toBeDefined()
+      expect(ctx.tools.get('mcp__shared__child', scopeOf(agentScope.ctx))).toBeDefined()
+    } finally {
+      await root?.dispose()
+      await child?.dispose()
+      await agentScope.dispose()
+    }
+  })
+
+  it('rejects a scoped MCP generation that would shadow an existing root tool', async () => {
+    registerPlainRootTool(ctx, 'mcp__scoped__remote')
+    const agentScope = await createAgentScope(ctx)
+
+    try {
+      await expect(apply(agentScope.ctx, {
+        ...stdioConfig,
+        serverName: 'scoped',
+        failOnStartupError: true,
+      }))
+        .rejects.toThrow('initial connection or tool synchronization failed')
+      expect(ctx.tools.get('mcp__scoped__remote')?.description).toBe('Plain root tool')
+    } finally {
+      await agentScope.dispose()
+    }
+  })
+
+  it('keeps a scoped MCP tool ahead of a root tool registered later', async () => {
+    const agentScope = await createAgentScope(ctx)
+
+    try {
+      const fiber = await mountMcpInAgentScope('scoped', agentScope.ctx)
+      registerPlainRootTool(ctx, 'mcp__scoped__remote')
+
+      expect(ctx.tools.get('mcp__scoped__remote')?.description).toBe('Plain root tool')
+      expect(ctx.tools.get('mcp__scoped__remote', scopeOf(agentScope.ctx))?.description).toBe('A remote tool')
+
+      await fiber.dispose()
+    } finally {
+      await agentScope.dispose()
+    }
+  })
+
+  it('settles activation rollback after startup timeout without releasing connect', async () => {
+    vi.useFakeTimers()
+    mockConnect.mockImplementation(async () => {
+      await new Promise<void>(() => {})
+    })
+    const agentScope = await createAgentScope(ctx)
+    const fiber = agentScope.ctx.plugin(ScopedMcpClient, {
+      ...stdioConfig,
+      failOnStartupError: true,
+      startupTimeoutMs: 1,
+    })
+    const activation = Promise.resolve(fiber)
+    let settled = false
+    void activation.then(() => { settled = true }, () => { settled = true })
+
+    try {
+      await vi.advanceTimersByTimeAsync(1)
+      expect(mockClose).toHaveBeenCalledTimes(1)
+      expect(settled).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(settled).toBe(true)
+      await expect(activation).rejects.toThrow('initial connection or tool synchronization failed')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('logs error and registers no tools when connect fails; dispose closes the client', async () => {
@@ -392,6 +613,7 @@ describe('apply (plugin lifecycle)', () => {
       url: 'http://localhost:3000/mcp',
       headers: { Authorization: 'Bearer x' },
       toolCallTimeoutMs: 30_000,
+      startupTimeoutMs: 30_000,
       failOnStartupError: false,
     }
 

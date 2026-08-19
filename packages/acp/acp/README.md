@@ -21,9 +21,9 @@ Both fields are optional so another agent/request listener may supply the target
 
 | Method | Behavior |
 |---|---|
-| `initialize` | Negotiates the supported version. Image prompts are advertised only when a durable attachment store is mounted and the configured exact provider/model resolves with explicit image input; audio and embedded context stay false. No session, editor, terminal, filesystem, or MCP capability is advertised. |
+| `initialize` | Negotiates the supported version. Image prompts are advertised only when a durable attachment store is mounted and the configured exact provider/model resolves with explicit image input; audio and embedded context stay false. HTTP MCP support is advertised. |
 | `authenticate` | No-op because the server advertises no authentication methods. |
-| `session/new` | Creates a fresh agent with an absolute primary `cwd`; empty `additionalDirectories` and `mcpServers` are accepted, non-empty values reject. |
+| `session/new` | Creates a fresh agent with an absolute primary `cwd`; empty `additionalDirectories` and `mcpServers` are accepted, non-empty `additionalDirectories` reject. It accepts stdio and HTTP `mcpServers`, validates every declaration before creating the agent, and mounts each server only in that agent's scope. Invalid declarations return `Invalid params`; connection or discovery failure returns `MCP server startup failed` without configuration data. |
 | `session/prompt` | Preserves ordered text and supported inline image blocks, renders resource links as bracketed textual references, and rejects audio, embedded resources, malformed/empty input, or an image when capability was not advertised. It validates the whole image batch and rechecks the session's latest exact route before any save, commits every image before the user event, permits one in-flight request per session, and waits for admission plus, once queued, whole-Agent idle and ordered output delivery. Normal quiescence reports `end_turn`; explicit ACP cancellation, disposal, or a prompt whose admission was discarded (a turnless slot) reports `cancelled`. |
 | `session/cancel` | Marks and aborts any in-progress admission without cancelling or waiting for unrelated Agent work; once this prompt has entered the Agent inbox, it cancels the addressed Agent and waits for the owned interval to quiesce. No late user message is published and the prompt settles as `cancelled`. With no in-flight prompt it cancels autonomous work; unknown ids are no-ops. |
 | `session/update` | Emits one `agent_message_chunk` per non-empty text or image block in a committed `assistant/message`, preserving order. Images are re-read and integrity-verified before inline base64 delivery. Raw deltas and non-message events are omitted. |
@@ -32,6 +32,26 @@ Both fields are optional so another agent/request listener may supply the target
 One connection may own several sessions. The bridge keys records by branded session id and checks exact agent identity before routing events or permission requests. Each session has an independent prompt slot, workspace, cancellation path, and disposer.
 
 Committed-message output intentionally trades token-by-token latency for a clean automation result. Uncommitted provider chunks and retry attempts cannot leak partial text or images; reasoning and tool activity remain in the session log for observability through other interfaces. Per-session delivery is serialized because attachment reads are asynchronous, and a missing or corrupt committed image fails the prompt response instead of emitting a placeholder.
+
+## Dynamic MCP servers
+
+`session/new.mcpServers` accepts ACP stdio entries and entries with `type: "http"`. Keep a stdio executable and its arguments as separate values; do not pass a shell command string:
+
+```ts
+const sessionNew = {
+  cwd: '/workspace/project',
+  mcpServers: [
+    { name: 'files', command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/workspace/project'], env: [] },
+    { name: 'search', type: 'http', url: 'https://mcp.example.com/mcp', headers: [] },
+  ],
+}
+```
+
+`initialize` advertises only the HTTP MCP capability. SSE and ACP transports reject rather than falling back to another transport. HTTP endpoints must use HTTPS, except `http:` is allowed for `localhost`, `127.0.0.1`, and `[::1]`; URLs with credentials or a fragment reject.
+
+Before spawning a command, resolving a host, opening a socket, or mounting a plugin, ACP validates every server's name, fields, size limits, and duplicate environment-variable or header names. Request errors return `Invalid params` with a safe field location; connection, discovery, or registration failures return the fixed internal startup error without commands, arguments, URLs, environment values, headers, or server diagnostics. ACP maps every dynamic server to `failOnStartupError: true`; initial connection and tool discovery use the MCP client's `startupTimeoutMs` default of `30000` ms.
+
+Each server mounts in the new Agent's scope. The session becomes visible only after all Agent setup completes; any setup failure rolls back the scope, tools, connections, and stdio children. The bridge owns cleanup when its connection ends. ACP has no `session/close` method, so callers cannot release one session independently.
 
 ## Lifecycle
 
@@ -76,6 +96,6 @@ Append-only through the owning tool result.
 ## Known Limitations and Deferred Work
 
 - **Fresh sessions only** — load, list, resume, delete, and fork are unsupported.
-- **Raster images and one workspace only** — image prompts require a durable store plus an exact route that declares image input; only PNG, JPEG, WebP, and GIF are accepted. Audio, embedded resources, non-empty additional directories, and MCP servers reject; resource links flatten to textual references rather than fetched content.
+- **Raster images and one workspace only** — image prompts require a durable store plus an exact route that declares image input; only PNG, JPEG, WebP, and GIF are accepted. Audio, embedded resources, and non-empty additional directories reject; resource links flatten to textual references rather than fetched content. Dynamic MCP supports stdio and HTTP only, not SSE or ACP transports.
 - **Committed answers only** — live progress, reasoning, tool activity, plans, titles, and usage stay off the wire.
 - **Connection-owned lifetime** — one connection releases all of its sessions; per-session close is not implemented.

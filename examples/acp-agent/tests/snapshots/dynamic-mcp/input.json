@@ -1,0 +1,17 @@
+{
+  "steps": [
+    { "op": "initialize" },
+    {
+      "op": "newSession",
+      "mcpServers": [
+        {
+          "name": "fixture",
+          "command": "{{node}}",
+          "args": ["{{cwd}}/fixture-server.mjs"],
+          "env": []
+        }
+      ]
+    },
+    { "op": "prompt", "text": "Add 2 and 3 with the MCP fixture, then reply exactly MCP_RESULT_OK: 5." }
+  ]
+}

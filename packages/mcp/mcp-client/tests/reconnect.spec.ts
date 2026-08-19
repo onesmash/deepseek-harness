@@ -190,7 +190,7 @@ describe('reconnect supervisor', () => {
     expect(ctx.tools.get('mcp__srv__remote')).toBeUndefined()
     // Initial connect + exactly maxAttempts reconnect attempts.
     expect(mockConnect).toHaveBeenCalledTimes(3)
-    expect(warns.some(line => line.includes('connection attempt failed: Error: server gone'))).toBe(true)
+    expect(warns.some(line => line === 'mcp-client(srv): connection attempt failed')).toBe(true)
     expect(warns.some(line => line.includes('connection failed; retrying in 4ms (attempt 2/2)'))).toBe(true)
     await sleep(30)
     expect(mockConnect).toHaveBeenCalledTimes(3)
@@ -274,19 +274,20 @@ describe('reconnect supervisor', () => {
     expect(instances).toHaveLength(1)
   })
 
-  it('bounds disposal while a resolving generation never reports that it closed', async () => {
+  it('shares and bounds disposal while a generation never settles', async () => {
     vi.useFakeTimers()
     try {
       const { errors } = captureLogs(ctx)
-      const gate: PromiseWithResolvers<void> = Promise.withResolvers()
-      mockConnect.mockImplementation(() => gate.promise)
+      mockConnect.mockImplementation(async () => {
+        await new Promise<void>(() => {})
+      })
       mockClose.mockResolvedValue(undefined)
       const handle = startConnection(ctx, stdioConfig(), resolveReconnectPolicy(undefined, 'reconnect'))
       await vi.advanceTimersByTimeAsync(0)
 
       const disposing = handle.dispose()
+      expect(handle.dispose()).toBe(disposing)
       await vi.advanceTimersByTimeAsync(5_000)
-      gate.resolve()
       await disposing
 
       expect(mockListTools).not.toHaveBeenCalled()

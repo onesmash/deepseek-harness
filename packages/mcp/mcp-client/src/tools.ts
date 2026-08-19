@@ -22,6 +22,7 @@ import { isImageAdmissionError } from '@deepseek-ai/dsh-attachment'
 import type { AttachmentStore, ImageAttachmentRef, ImageMediaType, SaveImageAttachment } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { JsonSchemaNode, JsonValue } from '@deepseek-ai/dsh-tools'
 
@@ -177,6 +178,13 @@ export async function syncTools(
   for (const dispose of previous.values()) dispose()
   const disposers: ToolDisposers = new Map()
   try {
+    if (scopeOf(ctx) !== undefined) {
+      for (const publicName of definitions.keys()) {
+        if (ctx.tools.get(publicName) !== undefined) {
+          throw new Error(`mcp-client(${opts.serverName}): scoped MCP tool "${publicName}" conflicts with an existing root tool`)
+        }
+      }
+    }
     for (const [publicName, definition] of definitions) {
       disposers.set(publicName, ctx.tools.register(definition))
     }

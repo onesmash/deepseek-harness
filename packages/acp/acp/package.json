@@ -33,6 +33,7 @@
   "license": "MIT",
   "dependencies": {
     "@agentclientprotocol/sdk": "0.25.1",
+    "@deepseek-ai/dsh-mcp-client": "workspace:^",
     "@deepseek-ai/schemastery": "workspace:^"
   },
   "peerDependencies": {
@@ -54,6 +55,8 @@
     "@deepseek-ai/dsh-session": "workspace:^",
     "@deepseek-ai/dsh-tools": "workspace:^",
     "@deepseek-ai/dsh-user-approval": "workspace:^",
-    "@deepseek-ai/cordis": "workspace:^"
+    "@deepseek-ai/cordis": "workspace:^",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^4.4.3"
   }
 }

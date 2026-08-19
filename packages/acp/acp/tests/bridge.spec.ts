@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
+import { fileURLToPath } from 'node:url'
+import { PROTOCOL_VERSION, type McpServer } from '@agentclientprotocol/sdk'
 import { AttachmentError } from '@deepseek-ai/dsh-attachment'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { makeBridgeHarness, textResponse, type BridgeHarness } from './harness.ts'
+
+const fixtureServerPath = fileURLToPath(new URL('./fixture-server.ts', import.meta.url))
 
 describe('automation-only ACP bridge', () => {
   let harness: BridgeHarness | undefined
@@ -12,7 +15,7 @@ describe('automation-only ACP bridge', () => {
     harness = undefined
   })
 
-  it('advertises only fresh text sessions', async () => {
+  it('advertises fresh text sessions and HTTP MCP', async () => {
     harness = await makeBridgeHarness()
     const response = await harness.client.initialize({
       protocolVersion: PROTOCOL_VERSION,
@@ -24,6 +27,7 @@ describe('automation-only ACP bridge', () => {
       agentInfo: { name: 'deepseek-harness-acp', version: '0.0.1' },
       agentCapabilities: {
         promptCapabilities: { image: false, audio: false, embeddedContext: false },
+        mcpCapabilities: { http: true },
       },
       authMethods: [],
     })
@@ -164,7 +168,25 @@ describe('automation-only ACP bridge', () => {
     expect(harness.adapter.requests[0]?.system).toContain(`Automation persona for mock in ${process.cwd()}.`)
   })
 
-  it('requires one absolute workspace and no MCP servers', async () => {
+  it('creates a session after stdio MCP tool discovery', async () => {
+    harness = await makeBridgeHarness()
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+
+    const { sessionId } = await harness.client.newSession({
+      cwd: process.cwd(),
+      mcpServers: [{
+        name: 'fixture',
+        command: process.execPath,
+        args: [fixtureServerPath],
+        env: [],
+      }],
+    })
+
+    const agent = harness.ctx.agents.get(SessionId(sessionId))
+    expect(harness.ctx.tools.get('mcp__fixture__add', agent)).toBeDefined()
+  }, 30_000)
+
+  it('requires one absolute workspace and no additional directories', async () => {
     harness = await makeBridgeHarness()
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
 
@@ -176,14 +198,53 @@ describe('automation-only ACP bridge', () => {
     })).rejects.toThrow(/additionalDirectories/)
     await expect(harness.client.newSession({
       cwd: process.cwd(),
-      mcpServers: [{ name: 'fs', command: 'node', args: [], env: [] }],
-    })).rejects.toThrow(/mcpServers/)
-
-    await expect(harness.client.newSession({
-      cwd: process.cwd(),
       mcpServers: [],
       additionalDirectories: [],
     })).resolves.toHaveProperty('sessionId')
+  })
+
+  const invalidMcpServerCases: Array<[string, McpServer]> = [
+    ['SSE', { type: 'sse', name: 'unsupported', url: 'https://example.test/mcp', headers: [] }],
+    ['ACP', { type: 'acp', name: 'unsupported', id: 'server-id' }],
+    ['non-loopback HTTP', { type: 'http', name: 'unsafe-http', url: 'http://example.test/mcp', headers: [] }],
+    ['duplicate environment names', {
+      name: 'duplicate-env', command: 'node', args: [], env: [{ name: 'TOKEN', value: 'one' }, { name: 'token', value: 'two' }],
+    }],
+    ['duplicate HTTP header names', {
+      type: 'http', name: 'duplicate-header', url: 'https://example.test/mcp', headers: [{ name: 'Authorization', value: 'one' }, { name: 'authorization', value: 'two' }],
+    }],
+  ]
+
+  it.each(invalidMcpServerCases)('rejects %s MCP configuration as invalid params', async (_label, server) => {
+    harness = await makeBridgeHarness()
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+
+    await expect(harness.client.newSession({ cwd: process.cwd(), mcpServers: [server] }))
+      .rejects.toMatchObject({ code: -32602 })
+  })
+
+  it('reports MCP startup failures without exposing server configuration', async () => {
+    const command = 'mcp-command-secret'
+    harness = await makeBridgeHarness()
+    const diagnostics: string[] = []
+    harness.ctx.logger.warn = (message: string) => { diagnostics.push(message) }
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+
+    const error = await harness.client.newSession({
+      cwd: process.cwd(),
+      mcpServers: [{ name: 'startup', command, args: ['mcp-argument-secret'], env: [{ name: 'MCP_ENV_SECRET', value: 'mcp-value-secret' }] }],
+    }).catch((reason: unknown) => reason)
+
+    expect(error).toMatchObject({ code: -32603, message: 'Internal error: MCP server startup failed' })
+    expect(String(error)).not.toContain(command)
+    expect(String(error)).not.toContain('mcp-argument-secret')
+    expect(String(error)).not.toContain('MCP_ENV_SECRET')
+    expect(String(error)).not.toContain('mcp-value-secret')
+    expect(diagnostics.some(line => line.startsWith('mcp-client(startup): connection attempt failed'))).toBe(true)
+    expect(diagnostics.join('\n')).not.toContain(command)
+    expect(diagnostics.join('\n')).not.toContain('mcp-argument-secret')
+    expect(diagnostics.join('\n')).not.toContain('MCP_ENV_SECRET')
+    expect(diagnostics.join('\n')).not.toContain('mcp-value-secret')
   })
 
   it('rejects empty and unadvertised image prompts before a turn starts', async () => {

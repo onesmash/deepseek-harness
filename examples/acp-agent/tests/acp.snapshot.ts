@@ -166,6 +166,14 @@ const SCENARIOS: Scenario[] = [
     configPath: SESSION_TITLE_CONFIG,
   },
   { name: 'tool-call-turn', hasModelTurn: true, recorded: true },
+  {
+    name: 'dynamic-mcp',
+    hasModelTurn: true,
+    recorded: false,
+    pinsHeader: true,
+    headerClass: 'dynamic-mcp',
+    systemPromptSource: 'text-turn',
+  },
   // Authored from the real PACKED_CHUNKS_SOURCE recording under the ordinary
   // app composition. The contract below pins decoded equality and all three
   // row kinds; replay additionally proves the assembled app re-packs identically.

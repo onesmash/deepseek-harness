@@ -170,6 +170,7 @@ describe.skipIf(!existsSync(acpBin))('dsh-acp-demo BUILT bin (node lib/bin.js, n
     const init = await client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     expect(init.agentCapabilities).toEqual({
       promptCapabilities: { image: false, audio: false, embeddedContext: false },
+      mcpCapabilities: { http: true },
     })
     const sessionCwd = consumer
     const { sessionId } = await client.newSession({ cwd: sessionCwd, mcpServers: [] })

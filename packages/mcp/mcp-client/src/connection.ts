@@ -177,12 +177,15 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
     scheduleReconnect()
   }
 
-  /** Wait for the transport-owned close signal without letting a broken transport wedge teardown forever. */
-  function waitForClose(closed: Promise<void>): Promise<boolean> {
+  /** Wait no longer than the generation close policy for one teardown action. */
+  function settlesWithinCloseTimeout(pending: Promise<unknown>): Promise<boolean> {
     return new Promise((resolve) => {
       const timeout = setTimeout(() => { resolve(false) }, GENERATION_CLOSE_TIMEOUT_MS)
       timeout.unref()
-      void closed.then(() => {
+      void pending.then(() => {
+        clearTimeout(timeout)
+        resolve(true)
+      }, () => {
         clearTimeout(timeout)
         resolve(true)
       })
@@ -261,10 +264,10 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
         ctx.logger.info(`${label}: tool list changed, re-syncing`)
         try {
           await enqueueSync(generation)
-        } catch (error) {
+        } catch {
           // Fetch-phase failure: the previous generation is still registered
           // and `disposers` still owns it — keep serving the last good list.
-          if (!disposed) ctx.logger.error(`${label}: tool re-sync failed: ${String(error)}`)
+          if (!disposed) ctx.logger.error(`${label}: tool re-sync failed`)
         }
       },
     )
@@ -280,9 +283,9 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
       if (firstAttemptError === undefined) firstAttemptError = error
       // Disposal clears current ownership before it closes the generation, so
       // only a live supervisor reports an attempt failure.
-      if (isCurrent(generation)) ctx.logger.warn(`${label}: connection attempt failed: ${String(error)}`)
+      if (isCurrent(generation)) ctx.logger.warn(`${label}: connection attempt failed`)
       try { await generation.close() } catch { /* transport already gone */ }
-      const quiesced = hasClosed() || await waitForClose(closed.promise)
+      const quiesced = hasClosed() || await settlesWithinCloseTimeout(closed.promise)
       attemptSettled = true
       if (!isCurrent(generation)) return
       if (!quiesced) {
@@ -322,30 +325,46 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
     return { error: firstAttemptError ?? new Error(`${label}: initial connection failed`) }
   })
 
+  let disposing: Promise<void> | undefined
+
+  async function dispose(): Promise<void> {
+    disposed = true
+    if (reconnectTimer !== undefined) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = undefined
+    }
+    const current = client
+    const currentClosed = clientClosed
+    client = undefined
+    clientClosed = undefined
+    const closeRequested = current === undefined
+      ? Promise.resolve(true)
+      : settlesWithinCloseTimeout(Promise.resolve().then(() => current.close()))
+    // A broken transport can leave its close signal, initial attempt, and a
+    // queued sync pending independently. Start their existing close-policy
+    // bounds together so cleanup has one bounded deadline rather than one
+    // timeout per pending operation.
+    const [closeRequestedSettled, generationClosed, attemptSettled, syncSettled] = await Promise.all([
+      closeRequested,
+      currentClosed === undefined ? Promise.resolve(true) : settlesWithinCloseTimeout(currentClosed),
+      settlesWithinCloseTimeout(settling),
+      settlesWithinCloseTimeout(syncChain),
+    ])
+    if (!closeRequestedSettled || !generationClosed) {
+      ctx.logger.error(`${label}: generation did not close within ${GENERATION_CLOSE_TIMEOUT_MS}ms during disposal — server shutdown may be incomplete`)
+    }
+    if (!attemptSettled) {
+      ctx.logger.error(`${label}: connection attempt did not settle within ${GENERATION_CLOSE_TIMEOUT_MS}ms during disposal — server shutdown may be incomplete`)
+    }
+    if (!syncSettled) {
+      ctx.logger.error(`${label}: tool synchronization did not settle within ${GENERATION_CLOSE_TIMEOUT_MS}ms during disposal — tool cleanup may be incomplete`)
+    }
+    for (const dispose of disposers.values()) dispose()
+    disposers = new Map()
+  }
+
   return {
     ready,
-    async dispose(): Promise<void> {
-      disposed = true
-      if (reconnectTimer !== undefined) {
-        clearTimeout(reconnectTimer)
-        reconnectTimer = undefined
-      }
-      const current = client
-      const currentClosed = clientClosed
-      client = undefined
-      clientClosed = undefined
-      if (current !== undefined) {
-        try { await current.close() } catch { /* transport already gone */ }
-        if (currentClosed !== undefined && !await waitForClose(currentClosed)) {
-          ctx.logger.error(`${label}: generation did not close within ${GENERATION_CLOSE_TIMEOUT_MS}ms during disposal — server shutdown may be incomplete`)
-        }
-      }
-      // Quiesce, don't just request it: the in-flight attempt enqueues its
-      // sync before settling, so awaiting both leaves `disposers` final.
-      await settling
-      await syncChain
-      for (const dispose of disposers.values()) dispose()
-      disposers = new Map()
-    },
+    dispose: () => (disposing ??= dispose()),
   }
 }

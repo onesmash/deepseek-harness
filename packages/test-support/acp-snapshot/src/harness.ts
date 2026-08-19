@@ -28,6 +28,7 @@ import {
   type ContentBlock as AcpContentBlock,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
+  type McpServer,
   type SessionNotification,
 } from '@agentclientprotocol/sdk'
 import { launchAcpTestAgent, type AgentUnderTest, type LaunchedAcpTestAgent } from './launcher.ts'
@@ -67,8 +68,8 @@ const WAIT_POLL_INTERVAL_MS = 10
  */
 export type InputStep =
   | { op: 'initialize' }
-  | { op: 'newSession' }
-  | { op: 'newSessionExpectError'; additionalDirectories?: string[] }
+  | { op: 'newSession'; mcpServers?: McpServer[] }
+  | { op: 'newSessionExpectError'; additionalDirectories?: string[]; mcpServers?: McpServer[] }
   | { op: 'prompt'; text: string }
   | { op: 'promptContent'; content: AcpContentBlock[] }
   | { op: 'promptAndWaitForAgentMessage'; text: string; waitForText: string }
@@ -399,18 +400,19 @@ async function runStep(
       })
       return
     case 'newSession': {
-      const { sessionId } = await client.newSession({ cwd, mcpServers: [] })
+      const { sessionId } = await client.newSession({
+        cwd,
+        mcpServers: expandMcpServers(step.mcpServers, cwd),
+      })
       setSessionId(sessionId)
       return
     }
     case 'newSessionExpectError': {
-      // The bridge rejects a session/new that widens the workspace scope
-      // (non-empty additionalDirectories / mcpServers — unimplemented). The SDK
-      // surfaces that as a rejected RPC; swallow it so the run completes and the
-      // error frame is captured in the transcript.
+      // The SDK surfaces expected session/new failures as rejected RPCs; swallow
+      // them so the run completes and the error frame is captured in the transcript.
       await client.newSession({
         cwd,
-        mcpServers: [],
+        mcpServers: expandMcpServers(step.mcpServers, cwd),
         ...step.additionalDirectories !== undefined ? { additionalDirectories: step.additionalDirectories } : {},
       }).then(
         () => { throw new Error('snapshot-harness: expected session/new to be rejected but it succeeded') },
@@ -521,6 +523,17 @@ async function runStep(
     default:
       throw new Error(`snapshot-harness: unknown input op ${JSON.stringify(step)}`)
   }
+}
+
+/** Expand the test harness's portable stdio command tokens without changing other ACP values. */
+function expandMcpServers(mcpServers: McpServer[] | undefined, cwd: string): McpServer[] {
+  return (mcpServers ?? []).map((server) => {
+    if (!('command' in server)) return server
+    const expand = (value: string): string => value
+      .replaceAll('{{node}}', process.execPath)
+      .replaceAll('{{cwd}}', cwd)
+    return { ...server, command: expand(server.command), args: server.args.map(expand) }
+  })
 }
 
 /** Wait until persistence exposes an open turn for the selected session. */

@@ -21,9 +21,9 @@
 
 | 方法 | 行为 |
 |---|---|
-| `initialize` | 协商受支持的版本。只有挂载持久附件存储，且配置的确切提供方／模型解析后明确支持图片输入时，才公布图片提示词能力；音频与嵌入上下文保持 false。不公布会话、编辑器、终端、文件系统或 MCP 能力。 |
+| `initialize` | 协商受支持的版本。只有挂载持久附件存储，且配置的确切提供方／模型解析后明确支持图片输入时，才公布图片提示词能力；音频与嵌入上下文保持 false。公布 HTTP MCP 支持。 |
 | `authenticate` | 空操作，因为服务器不公布身份验证方法。 |
-| `session/new` | 以绝对路径作为主 `cwd` 创建新 agent；接受空的 `additionalDirectories` 和 `mcpServers`，拒绝非空值。 |
+| `session/new` | 以绝对路径作为主 `cwd` 创建新 agent；接受空的 `additionalDirectories` 和 `mcpServers`，拒绝非空 `additionalDirectories`。它接受 stdio 和 HTTP `mcpServers`，在创建 agent 前校验每项声明，并只在该 agent 的 scope 中挂载每台服务器。无效声明返回 `Invalid params`；连接或发现失败返回不含配置数据的 `MCP server startup failed`。 |
 | `session/prompt` | 保留文本与受支持内联图片块的顺序，将资源链接渲染为带方括号的文本引用，并拒绝音频、嵌入资源、格式错误／空输入，或在未公布能力时提交图片。它会先校验完整图片批次并重新检查会话的最新确切路由，再保存任一成员；在用户事件前提交全部图片；每个会话只允许一个正在处理的请求，并等待准入，以及消息入队后的整个 Agent 空闲和有序输出交付全部停稳。正常完全停稳时报告 `end_turn`；显式 ACP 取消、资源释放，或准入被丢弃的提示词（无轮次槽位）时报告 `cancelled`。 |
 | `session/cancel` | 标记并中止正在进行的准入，但不会取消或等待同一 Agent 上无关的既有工作；该提示词进入 Agent inbox 后，才会取消指定的 Agent 并等待自有区间停稳。不发布迟到的用户消息，提示词以 `cancelled` 结算。没有进行中的提示词时会取消自主工作；未知 id 为空操作。 |
 | `session/update` | 为已提交 `assistant/message` 中的每个非空文本或图片块发出一个 `agent_message_chunk`，并保留顺序。图片在以内联 base64 交付前会重新读取并校验完整性。省略原始增量和非消息事件。 |
@@ -32,6 +32,26 @@
 一个连接可以拥有多个会话。桥接层以带品牌的会话 id 作为记录键，并在路由事件或权限请求前检查 agent 是否为同一对象。每个会话都有独立的提示词槽位、工作区、取消路径和资源释放器。
 
 已提交消息输出有意牺牲逐 token 输出的低延迟，以换取干净的自动化结果。未提交的提供方分片和重试尝试无法泄漏部分文本或图片；推理与工具活动仍保留在会话日志中，以便其他界面观测。由于附件读取是异步的，每个会话会串行交付内容；已提交图片缺失或损坏时，提示词响应会失败，而不会发出占位符。
+
+## 动态 MCP 服务器
+
+`session/new.mcpServers` 接受 ACP stdio 条目和带有 `type: "http"` 的条目。stdio 可执行文件与参数必须分开传递，不能传入 shell 命令字符串：
+
+```ts
+const sessionNew = {
+  cwd: '/workspace/project',
+  mcpServers: [
+    { name: 'files', command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/workspace/project'], env: [] },
+    { name: 'search', type: 'http', url: 'https://mcp.example.com/mcp', headers: [] },
+  ],
+}
+```
+
+`initialize` 只公布 HTTP MCP capability。SSE 和 ACP 传输会被拒绝，不会回退到其他传输。HTTP endpoint 必须使用 HTTPS；仅 `localhost`、`127.0.0.1` 与 `[::1]` 可使用 `http:`。带凭据或 fragment 的 URL 会被拒绝。
+
+ACP 会在 spawn 命令、解析主机、打开 socket 或挂载插件之前，校验每台服务器的名称、字段、大小限制，以及重复的环境变量名或 header 名。请求错误以带安全字段位置的 `Invalid params` 返回；连接、发现或注册失败会返回固定的内部启动错误，不包含 command、args、URL、环境变量值、header 或服务器诊断。ACP 会为每台动态服务器映射 `failOnStartupError: true`；初始连接和工具发现使用 MCP client 的 `startupTimeoutMs` 默认值 `30000` 毫秒。
+
+每台服务器都挂载在新 Agent 的 scope 中。只有全部 Agent setup 完成后会话才会公开；任何 setup 失败都会回滚 scope、工具、连接和 stdio 子进程。bridge 在连接结束时拥有清理职责。ACP 没有 `session/close` 方法，调用方不能单独释放某个会话。
 
 ## 生命周期
 
@@ -76,6 +96,6 @@ ACP 要求每个提示词响应都携带 `stopReason`，但桥接层不声称它
 ## 已知限制与暂缓事项
 
 - **仅新会话**：不支持加载、列出、恢复、删除和 fork。
-- **仅光栅图片和一个 workspace**：图片提示词要求持久存储以及明确声明支持图片输入的确切路由；只接受 PNG、JPEG、WebP 和 GIF。音频、嵌入资源、非空附加目录和 MCP 服务器都会被拒绝；资源链接只会展平为文本引用，不会获取其内容。
+- **仅光栅图片和一个 workspace**：图片提示词要求持久存储以及明确声明支持图片输入的确切路由；只接受 PNG、JPEG、WebP 和 GIF。音频、嵌入资源和非空附加目录都会被拒绝；资源链接只会展平为文本引用，不会获取其内容。动态 MCP 只支持 stdio 和 HTTP，不支持 SSE 或 ACP 传输。
 - **仅已提交答案**：实时进度、推理、工具活动、计划、标题和用量不会通过协议传输。
 - **由连接管理的生命周期**：一个连接会释放其所有会话；尚未实现单个会话关闭功能。
